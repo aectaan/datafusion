@@ -26,7 +26,7 @@ use crate::datasource::listing::ListingTableUrl;
 use crate::datasource::physical_plan::FileSinkConfig;
 use crate::datasource::source_as_provider;
 use crate::error::{DataFusionError, Result};
-use crate::execution::context::{ExecutionProps, SessionState};
+use crate::execution::context::SessionState;
 use crate::logical_expr::utils::generate_sort_key;
 use crate::logical_expr::{
     Aggregate, EmptyRelation, Join, Projection, Sort, TableScan, Unnest, Window,
@@ -36,7 +36,6 @@ use crate::logical_expr::{
     UserDefinedLogicalNode,
 };
 use crate::logical_expr::{Limit, Values};
-use crate::physical_expr::{create_physical_expr, create_physical_exprs};
 use crate::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use crate::physical_plan::analyze::AnalyzeExec;
 use crate::physical_plan::empty::EmptyExec;
@@ -72,17 +71,22 @@ use datafusion_common::{
     ScalarValue,
 };
 use datafusion_expr::dml::CopyTo;
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr::{
     physical_name, AggregateFunction, Alias, GroupingSet, WindowFunction,
 };
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
+
 use datafusion_expr::{
     DescribeTable, DmlStatement, Extension, Filter, RecursiveQuery, SortExpr,
     StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::Literal;
+use datafusion_physical_expr::planner::{
+    DefaultPhysicalExpressionPlanner, PhysicalExpressionPlanner,
+};
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_sql::utils::window_expr_common_partition_keys;
@@ -161,9 +165,18 @@ pub trait ExtensionPlanner {
 /// execute concurrently.
 ///
 /// [`planning_concurrency`]: crate::config::ExecutionOptions::planning_concurrency
-#[derive(Default)]
 pub struct DefaultPhysicalPlanner {
     extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+    expr_creator: Arc<dyn PhysicalExpressionPlanner + Send + Sync>,
+}
+
+impl Default for DefaultPhysicalPlanner {
+    fn default() -> Self {
+        Self {
+            extension_planners: Default::default(),
+            expr_creator: Arc::new(DefaultPhysicalExpressionPlanner),
+        }
+    }
 }
 
 #[async_trait]
@@ -189,16 +202,20 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
     /// Create a physical expression from a logical expression
     /// suitable for evaluation
     ///
-    /// `e`: the expression to convert
+    /// `expr`: the expression to convert
     ///
-    /// `input_dfschema`: the logical plan schema for evaluating `e`
+    /// `input_dfschema`: the logical plan schema for evaluating `expr`.
     fn create_physical_expr(
         &self,
         expr: &Expr,
         input_dfschema: &DFSchema,
         session_state: &SessionState,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        create_physical_expr(expr, input_dfschema, session_state.execution_props())
+        self.create_physical_expr_using_execution_props(
+            expr,
+            input_dfschema,
+            session_state.execution_props(),
+        )
     }
 }
 
@@ -260,6 +277,17 @@ struct LogicalNode<'a> {
 }
 
 impl DefaultPhysicalPlanner {
+    /// Make a new [`DefaultPhysicalPlanner`].
+    pub fn new(
+        extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+        expr_creator: Arc<dyn PhysicalExpressionPlanner + Send + Sync>,
+    ) -> Self {
+        Self {
+            extension_planners,
+            expr_creator,
+        }
+    }
+
     /// Create a physical planner that uses `extension_planners` to
     /// plan user-defined logical nodes [`LogicalPlan::Extension`].
     /// The planner uses the first [`ExtensionPlanner`] to return a non-`None`
@@ -267,7 +295,10 @@ impl DefaultPhysicalPlanner {
     pub fn with_extension_planners(
         extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
     ) -> Self {
-        Self { extension_planners }
+        Self {
+            extension_planners,
+            expr_creator: Arc::new(DefaultPhysicalExpressionPlanner),
+        }
     }
 
     /// Create a physical plan from a logical plan
@@ -632,7 +663,7 @@ impl DefaultPhysicalPlanner {
                 let window_expr = window_expr
                     .iter()
                     .map(|e| {
-                        create_window_expr(
+                        self.create_window_expr(
                             e,
                             logical_schema,
                             session_state.execution_props(),
@@ -688,7 +719,7 @@ impl DefaultPhysicalPlanner {
                 let agg_filter = aggr_expr
                     .iter()
                     .map(|e| {
-                        create_aggregate_expr_and_maybe_filter(
+                        self.create_aggregate_expr_and_maybe_filter(
                             e,
                             logical_input_schema,
                             &physical_input_schema,
@@ -812,7 +843,7 @@ impl DefaultPhysicalPlanner {
             }) => {
                 let physical_input = children.one()?;
                 let input_dfschema = input.as_ref().schema();
-                let sort_expr = create_physical_sort_exprs(
+                let sort_expr = self.create_physical_sort_exprs(
                     expr,
                     input_dfschema,
                     session_state.execution_props(),
@@ -975,13 +1006,13 @@ impl DefaultPhysicalPlanner {
                 // All equi-join keys are columns now, create physical join plan
                 let left_df_schema = left.schema();
                 let right_df_schema = right.schema();
-                let execution_props = session_state.execution_props();
                 let join_on = keys
                     .iter()
                     .map(|(l, r)| {
-                        let l = create_physical_expr(l, left_df_schema, execution_props)?;
+                        let l =
+                            self.create_physical_expr(l, left_df_schema, session_state)?;
                         let r =
-                            create_physical_expr(r, right_df_schema, execution_props)?;
+                            self.create_physical_expr(r, right_df_schema, session_state)?;
                         Ok((l, r))
                     })
                     .collect::<Result<join_utils::JoinOn>>()?;
@@ -1042,10 +1073,10 @@ impl DefaultPhysicalPlanner {
                         )?;
                         let filter_schema =
                             Schema::new_with_metadata(filter_fields, HashMap::new());
-                        let filter_expr = create_physical_expr(
+                        let filter_expr = self.create_physical_expr(
                             expr,
                             &filter_df_schema,
-                            session_state.execution_props(),
+                            session_state,
                         )?;
                         let column_indices = join_utils::JoinFilter::build_column_indices(
                             left_field_indices,
@@ -1241,28 +1272,27 @@ impl DefaultPhysicalPlanner {
     ) -> Result<PhysicalGroupBy> {
         if group_expr.len() == 1 {
             match &group_expr[0] {
-                Expr::GroupingSet(GroupingSet::GroupingSets(grouping_sets)) => {
-                    merge_grouping_set_physical_expr(
+                Expr::GroupingSet(GroupingSet::GroupingSets(grouping_sets)) => self
+                    .merge_grouping_set_physical_expr(
                         grouping_sets,
                         input_dfschema,
                         input_schema,
                         session_state,
-                    )
-                }
-                Expr::GroupingSet(GroupingSet::Cube(exprs)) => create_cube_physical_expr(
-                    exprs,
-                    input_dfschema,
-                    input_schema,
-                    session_state,
-                ),
-                Expr::GroupingSet(GroupingSet::Rollup(exprs)) => {
-                    create_rollup_physical_expr(
+                    ),
+                Expr::GroupingSet(GroupingSet::Cube(exprs)) => self
+                    .create_cube_physical_expr(
                         exprs,
                         input_dfschema,
                         input_schema,
                         session_state,
-                    )
-                }
+                    ),
+                Expr::GroupingSet(GroupingSet::Rollup(exprs)) => self
+                    .create_rollup_physical_expr(
+                        exprs,
+                        input_dfschema,
+                        input_schema,
+                        session_state,
+                    ),
                 expr => Ok(PhysicalGroupBy::new_single(vec![tuple_err((
                     self.create_physical_expr(expr, input_dfschema, session_state),
                     physical_name(expr),
@@ -1282,180 +1312,417 @@ impl DefaultPhysicalPlanner {
             ))
         }
     }
-}
 
-/// Expand and align a GROUPING SET expression.
-/// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)
-///
-/// This will take a list of grouping sets and ensure that each group is
-/// properly aligned for the physical execution plan. We do this by
-/// identifying all unique expression in each group and conforming each
-/// group to the same set of expression types and ordering.
-/// For example, if we have something like `GROUPING SETS ((a,b,c),(a),(b),(b,c))`
-/// we would expand this to `GROUPING SETS ((a,b,c),(a,NULL,NULL),(NULL,b,NULL),(NULL,b,c))
-/// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)
-fn merge_grouping_set_physical_expr(
-    grouping_sets: &[Vec<Expr>],
-    input_dfschema: &DFSchema,
-    input_schema: &Schema,
-    session_state: &SessionState,
-) -> Result<PhysicalGroupBy> {
-    let num_groups = grouping_sets.len();
-    let mut all_exprs: Vec<Expr> = vec![];
-    let mut grouping_set_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
-    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
+    /// Expand and align a GROUPING SET expression.
+    /// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)
+    ///
+    /// This will take a list of grouping sets and ensure that each group is
+    /// properly aligned for the physical execution plan. We do this by
+    /// identifying all unique expression in each group and conforming each
+    /// group to the same set of expression types and ordering.
+    /// For example, if we have something like `GROUPING SETS ((a,b,c),(a),(b),(b,c))`
+    /// we would expand this to `GROUPING SETS ((a,b,c),(a,NULL,NULL),(NULL,b,NULL),(NULL,b,c))
+    /// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)
+    fn merge_grouping_set_physical_expr(
+        &self,
+        grouping_sets: &[Vec<Expr>],
+        input_dfschema: &DFSchema,
+        input_schema: &Schema,
+        session_state: &SessionState,
+    ) -> Result<PhysicalGroupBy> {
+        let num_groups = grouping_sets.len();
+        let mut all_exprs: Vec<Expr> = vec![];
+        let mut grouping_set_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
+        let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
 
-    for expr in grouping_sets.iter().flatten() {
-        if !all_exprs.contains(expr) {
-            all_exprs.push(expr.clone());
+        for expr in grouping_sets.iter().flatten() {
+            if !all_exprs.contains(expr) {
+                all_exprs.push(expr.clone());
 
-            grouping_set_expr.push(get_physical_expr_pair(
-                expr,
-                input_dfschema,
-                session_state,
-            )?);
+                grouping_set_expr.push(self.get_physical_expr_pair(
+                    expr,
+                    input_dfschema,
+                    session_state,
+                )?);
 
-            null_exprs.push(get_null_physical_expr_pair(
+                null_exprs.push(self.get_null_physical_expr_pair(
+                    expr,
+                    input_dfschema,
+                    input_schema,
+                    session_state,
+                )?);
+            }
+        }
+
+        let mut merged_sets: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
+
+        for expr_group in grouping_sets.iter() {
+            let group: Vec<bool> = all_exprs
+                .iter()
+                .map(|expr| !expr_group.contains(expr))
+                .collect();
+
+            merged_sets.push(group)
+        }
+
+        Ok(PhysicalGroupBy::new(
+            grouping_set_expr,
+            null_exprs,
+            merged_sets,
+        ))
+    }
+
+    fn create_physical_expr_using_execution_props(
+        &self,
+        expr: &Expr,
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        self.expr_creator
+            .create_physical_expr(expr, input_dfschema, execution_props)
+    }
+
+    fn get_physical_expr_pair(
+        &self,
+        expr: &Expr,
+        input_dfschema: &DFSchema,
+        session_state: &SessionState,
+    ) -> Result<(Arc<dyn PhysicalExpr>, String)> {
+        let physical_expr =
+            self.create_physical_expr(expr, input_dfschema, session_state)?;
+        let physical_name = physical_name(expr)?;
+        Ok((physical_expr, physical_name))
+    }
+
+    /// For a given logical expr, get a properly typed NULL ScalarValue physical expression
+    fn get_null_physical_expr_pair(
+        &self,
+        expr: &Expr,
+        input_dfschema: &DFSchema,
+        input_schema: &Schema,
+        session_state: &SessionState,
+    ) -> Result<(Arc<dyn PhysicalExpr>, String)> {
+        let physical_expr =
+            self.create_physical_expr(expr, input_dfschema, session_state)?;
+        let physical_name = physical_name(&expr.clone())?;
+
+        let data_type = physical_expr.data_type(input_schema)?;
+        let null_value: ScalarValue = (&data_type).try_into()?;
+
+        let null_value = Literal::new(null_value);
+        Ok((Arc::new(null_value), physical_name))
+    }
+
+    /// Expand and align a CUBE expression. This is a special case of GROUPING SETS
+    /// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)
+    fn create_cube_physical_expr(
+        &self,
+        exprs: &[Expr],
+        input_dfschema: &DFSchema,
+        input_schema: &Schema,
+        session_state: &SessionState,
+    ) -> Result<PhysicalGroupBy> {
+        let num_of_exprs = exprs.len();
+        let num_groups = num_of_exprs * num_of_exprs;
+
+        let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(num_of_exprs);
+        let mut all_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(num_of_exprs);
+
+        for expr in exprs {
+            null_exprs.push(self.get_null_physical_expr_pair(
                 expr,
                 input_dfschema,
                 input_schema,
                 session_state,
             )?);
+
+            all_exprs.push(self.get_physical_expr_pair(
+                expr,
+                input_dfschema,
+                session_state,
+            )?)
         }
-    }
 
-    let mut merged_sets: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
+        let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
 
-    for expr_group in grouping_sets.iter() {
-        let group: Vec<bool> = all_exprs
-            .iter()
-            .map(|expr| !expr_group.contains(expr))
-            .collect();
+        groups.push(vec![false; num_of_exprs]);
 
-        merged_sets.push(group)
-    }
-
-    Ok(PhysicalGroupBy::new(
-        grouping_set_expr,
-        null_exprs,
-        merged_sets,
-    ))
-}
-
-/// Expand and align a CUBE expression. This is a special case of GROUPING SETS
-/// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)
-fn create_cube_physical_expr(
-    exprs: &[Expr],
-    input_dfschema: &DFSchema,
-    input_schema: &Schema,
-    session_state: &SessionState,
-) -> Result<PhysicalGroupBy> {
-    let num_of_exprs = exprs.len();
-    let num_groups = num_of_exprs * num_of_exprs;
-
-    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(num_of_exprs);
-    let mut all_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(num_of_exprs);
-
-    for expr in exprs {
-        null_exprs.push(get_null_physical_expr_pair(
-            expr,
-            input_dfschema,
-            input_schema,
-            session_state,
-        )?);
-
-        all_exprs.push(get_physical_expr_pair(expr, input_dfschema, session_state)?)
-    }
-
-    let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
-
-    groups.push(vec![false; num_of_exprs]);
-
-    for null_count in 1..=num_of_exprs {
-        for null_idx in (0..num_of_exprs).combinations(null_count) {
-            let mut next_group: Vec<bool> = vec![false; num_of_exprs];
-            null_idx.into_iter().for_each(|i| next_group[i] = true);
-            groups.push(next_group);
-        }
-    }
-
-    Ok(PhysicalGroupBy::new(all_exprs, null_exprs, groups))
-}
-
-/// Expand and align a ROLLUP expression. This is a special case of GROUPING SETS
-/// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)
-fn create_rollup_physical_expr(
-    exprs: &[Expr],
-    input_dfschema: &DFSchema,
-    input_schema: &Schema,
-    session_state: &SessionState,
-) -> Result<PhysicalGroupBy> {
-    let num_of_exprs = exprs.len();
-
-    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(num_of_exprs);
-    let mut all_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(num_of_exprs);
-
-    let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_of_exprs + 1);
-
-    for expr in exprs {
-        null_exprs.push(get_null_physical_expr_pair(
-            expr,
-            input_dfschema,
-            input_schema,
-            session_state,
-        )?);
-
-        all_exprs.push(get_physical_expr_pair(expr, input_dfschema, session_state)?)
-    }
-
-    for total in 0..=num_of_exprs {
-        let mut group: Vec<bool> = Vec::with_capacity(num_of_exprs);
-
-        for index in 0..num_of_exprs {
-            if index < total {
-                group.push(false);
-            } else {
-                group.push(true);
+        for null_count in 1..=num_of_exprs {
+            for null_idx in (0..num_of_exprs).combinations(null_count) {
+                let mut next_group: Vec<bool> = vec![false; num_of_exprs];
+                null_idx.into_iter().for_each(|i| next_group[i] = true);
+                groups.push(next_group);
             }
         }
 
-        groups.push(group)
+        Ok(PhysicalGroupBy::new(all_exprs, null_exprs, groups))
     }
 
-    Ok(PhysicalGroupBy::new(all_exprs, null_exprs, groups))
-}
+    /// Expand and align a ROLLUP expression. This is a special case of GROUPING SETS
+    /// (see <https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS>)
+    fn create_rollup_physical_expr(
+        &self,
+        exprs: &[Expr],
+        input_dfschema: &DFSchema,
+        input_schema: &Schema,
+        session_state: &SessionState,
+    ) -> Result<PhysicalGroupBy> {
+        let num_of_exprs = exprs.len();
 
-/// For a given logical expr, get a properly typed NULL ScalarValue physical expression
-fn get_null_physical_expr_pair(
-    expr: &Expr,
-    input_dfschema: &DFSchema,
-    input_schema: &Schema,
-    session_state: &SessionState,
-) -> Result<(Arc<dyn PhysicalExpr>, String)> {
-    let physical_expr =
-        create_physical_expr(expr, input_dfschema, session_state.execution_props())?;
-    let physical_name = physical_name(&expr.clone())?;
+        let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(num_of_exprs);
+        let mut all_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(num_of_exprs);
 
-    let data_type = physical_expr.data_type(input_schema)?;
-    let null_value: ScalarValue = (&data_type).try_into()?;
+        let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_of_exprs + 1);
 
-    let null_value = Literal::new(null_value);
-    Ok((Arc::new(null_value), physical_name))
-}
+        for expr in exprs {
+            null_exprs.push(self.get_null_physical_expr_pair(
+                expr,
+                input_dfschema,
+                input_schema,
+                session_state,
+            )?);
 
-fn get_physical_expr_pair(
-    expr: &Expr,
-    input_dfschema: &DFSchema,
-    session_state: &SessionState,
-) -> Result<(Arc<dyn PhysicalExpr>, String)> {
-    let physical_expr =
-        create_physical_expr(expr, input_dfschema, session_state.execution_props())?;
-    let physical_name = physical_name(expr)?;
-    Ok((physical_expr, physical_name))
+            all_exprs.push(self.get_physical_expr_pair(
+                expr,
+                input_dfschema,
+                session_state,
+            )?)
+        }
+
+        for total in 0..=num_of_exprs {
+            let mut group: Vec<bool> = Vec::with_capacity(num_of_exprs);
+
+            for index in 0..num_of_exprs {
+                if index < total {
+                    group.push(false);
+                } else {
+                    group.push(true);
+                }
+            }
+
+            groups.push(group)
+        }
+
+        Ok(PhysicalGroupBy::new(all_exprs, null_exprs, groups))
+    }
+
+    /// Create a window expression with a name from a logical expression
+    pub fn create_window_expr_with_name(
+        &self,
+        e: &Expr,
+        name: impl Into<String>,
+        logical_schema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn WindowExpr>> {
+        let name = name.into();
+        let physical_schema: &Schema = &logical_schema.into();
+        match e {
+            Expr::WindowFunction(WindowFunction {
+                fun,
+                args,
+                partition_by,
+                order_by,
+                window_frame,
+                null_treatment,
+            }) => {
+                let physical_args = self.expr_creator.create_physical_exprs(
+                    args,
+                    logical_schema,
+                    execution_props,
+                )?;
+                let partition_by = self.expr_creator.create_physical_exprs(
+                    partition_by,
+                    logical_schema,
+                    execution_props,
+                )?;
+                let order_by = self.create_physical_sort_exprs(
+                    order_by,
+                    logical_schema,
+                    execution_props,
+                )?;
+
+                if !is_window_frame_bound_valid(window_frame) {
+                    return plan_err!(
+                        "Invalid window frame: start bound ({}) cannot be larger than end bound ({})",
+                        window_frame.start_bound, window_frame.end_bound
+                    );
+                }
+
+                let window_frame = Arc::new(window_frame.clone());
+                let ignore_nulls = null_treatment.unwrap_or(NullTreatment::RespectNulls)
+                    == NullTreatment::IgnoreNulls;
+                windows::create_window_expr(
+                    fun,
+                    name,
+                    &physical_args,
+                    &partition_by,
+                    &order_by,
+                    window_frame,
+                    physical_schema,
+                    ignore_nulls,
+                )
+            }
+            other => plan_err!("Invalid window expression '{other:?}'"),
+        }
+    }
+
+    /// Create an aggregate expression with a name from a logical expression
+    pub fn create_aggregate_expr_with_name_and_maybe_filter(
+        &self,
+        e: &Expr,
+        name: Option<String>,
+        logical_input_schema: &DFSchema,
+        physical_input_schema: &Schema,
+        execution_props: &ExecutionProps,
+    ) -> Result<AggregateExprWithOptionalArgs> {
+        match e {
+            Expr::AggregateFunction(AggregateFunction {
+                func,
+                distinct,
+                args,
+                filter,
+                order_by,
+                null_treatment,
+            }) => {
+                let name = if let Some(name) = name {
+                    name
+                } else {
+                    physical_name(e)?
+                };
+
+                let physical_args = self.expr_creator.create_physical_exprs(
+                    args,
+                    logical_input_schema,
+                    execution_props,
+                )?;
+                let filter = match filter {
+                    Some(e) => Some(self.create_physical_expr_using_execution_props(
+                        e,
+                        logical_input_schema,
+                        execution_props,
+                    )?),
+                    None => None,
+                };
+
+                let ignore_nulls = null_treatment.unwrap_or(NullTreatment::RespectNulls)
+                    == NullTreatment::IgnoreNulls;
+
+                let (agg_expr, filter, order_by) = {
+                    let physical_sort_exprs = match order_by {
+                        Some(exprs) => Some(self.create_physical_sort_exprs(
+                            exprs,
+                            logical_input_schema,
+                            execution_props,
+                        )?),
+                        None => None,
+                    };
+
+                    let ordering_reqs: Vec<PhysicalSortExpr> =
+                        physical_sort_exprs.clone().unwrap_or(vec![]);
+
+                    let agg_expr = AggregateExprBuilder::new(
+                        func.to_owned(),
+                        physical_args.to_vec(),
+                    )
+                    .order_by(ordering_reqs.to_vec())
+                    .schema(Arc::new(physical_input_schema.to_owned()))
+                    .alias(name)
+                    .with_ignore_nulls(ignore_nulls)
+                    .with_distinct(*distinct)
+                    .build()
+                    .map(Arc::new)?;
+
+                    (agg_expr, filter, physical_sort_exprs)
+                };
+
+                Ok((agg_expr, filter, order_by))
+            }
+            other => internal_err!("Invalid aggregate expression '{other:?}'"),
+        }
+    }
+
+    /// Create vector of physical sort expression from a vector of logical expression
+    pub fn create_physical_sort_exprs(
+        &self,
+        exprs: &[SortExpr],
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<LexOrdering> {
+        exprs
+            .iter()
+            .map(|expr| {
+                self.create_physical_sort_expr(expr, input_dfschema, execution_props)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Create an aggregate expression from a logical expression or an alias
+    pub fn create_aggregate_expr_and_maybe_filter(
+        &self,
+        e: &Expr,
+        logical_input_schema: &DFSchema,
+        physical_input_schema: &Schema,
+        execution_props: &ExecutionProps,
+    ) -> Result<AggregateExprWithOptionalArgs> {
+        // unpack (nested) aliased logical expressions, e.g. "sum(col) as total"
+        let (name, e) = match e {
+            Expr::Alias(Alias { expr, name, .. }) => (Some(name.clone()), expr.as_ref()),
+            Expr::AggregateFunction(_) => (Some(e.schema_name().to_string()), e),
+            _ => (None, e),
+        };
+
+        self.create_aggregate_expr_with_name_and_maybe_filter(
+            e,
+            name,
+            logical_input_schema,
+            physical_input_schema,
+            execution_props,
+        )
+    }
+
+    /// Create a physical sort expression from a logical expression
+    pub fn create_physical_sort_expr(
+        &self,
+        e: &SortExpr,
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<PhysicalSortExpr> {
+        let SortExpr {
+            expr,
+            asc,
+            nulls_first,
+        } = e;
+        Ok(PhysicalSortExpr {
+            expr: self.create_physical_expr_using_execution_props(
+                expr,
+                input_dfschema,
+                execution_props,
+            )?,
+            options: SortOptions {
+                descending: !asc,
+                nulls_first: *nulls_first,
+            },
+        })
+    }
+
+    /// Create a window expression from a logical expression or an alias
+    pub fn create_window_expr(
+        &self,
+        e: &Expr,
+        logical_schema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn WindowExpr>> {
+        // unpack aliased logical expressions, e.g. "sum(col) over () as total"
+        let (name, e) = match e {
+            Expr::Alias(Alias { expr, name, .. }) => (name.clone(), expr.as_ref()),
+            _ => (e.schema_name().to_string(), e),
+        };
+        self.create_window_expr_with_name(e, name, logical_schema, execution_props)
+    }
 }
 
 /// Check if window bounds are valid after schema information is available, and
@@ -1478,70 +1745,6 @@ pub fn is_window_frame_bound_valid(window_frame: &WindowFrame) -> bool {
     }
 }
 
-/// Create a window expression with a name from a logical expression
-pub fn create_window_expr_with_name(
-    e: &Expr,
-    name: impl Into<String>,
-    logical_schema: &DFSchema,
-    execution_props: &ExecutionProps,
-) -> Result<Arc<dyn WindowExpr>> {
-    let name = name.into();
-    let physical_schema: &Schema = &logical_schema.into();
-    match e {
-        Expr::WindowFunction(WindowFunction {
-            fun,
-            args,
-            partition_by,
-            order_by,
-            window_frame,
-            null_treatment,
-        }) => {
-            let physical_args =
-                create_physical_exprs(args, logical_schema, execution_props)?;
-            let partition_by =
-                create_physical_exprs(partition_by, logical_schema, execution_props)?;
-            let order_by =
-                create_physical_sort_exprs(order_by, logical_schema, execution_props)?;
-
-            if !is_window_frame_bound_valid(window_frame) {
-                return plan_err!(
-                        "Invalid window frame: start bound ({}) cannot be larger than end bound ({})",
-                        window_frame.start_bound, window_frame.end_bound
-                    );
-            }
-
-            let window_frame = Arc::new(window_frame.clone());
-            let ignore_nulls = null_treatment.unwrap_or(NullTreatment::RespectNulls)
-                == NullTreatment::IgnoreNulls;
-            windows::create_window_expr(
-                fun,
-                name,
-                &physical_args,
-                &partition_by,
-                &order_by,
-                window_frame,
-                physical_schema,
-                ignore_nulls,
-            )
-        }
-        other => plan_err!("Invalid window expression '{other:?}'"),
-    }
-}
-
-/// Create a window expression from a logical expression or an alias
-pub fn create_window_expr(
-    e: &Expr,
-    logical_schema: &DFSchema,
-    execution_props: &ExecutionProps,
-) -> Result<Arc<dyn WindowExpr>> {
-    // unpack aliased logical expressions, e.g. "sum(col) over () as total"
-    let (name, e) = match e {
-        Expr::Alias(Alias { expr, name, .. }) => (name.clone(), expr.as_ref()),
-        _ => (e.schema_name().to_string(), e),
-    };
-    create_window_expr_with_name(e, name, logical_schema, execution_props)
-}
-
 type AggregateExprWithOptionalArgs = (
     Arc<AggregateFunctionExpr>,
     // The filter clause, if any
@@ -1549,130 +1752,6 @@ type AggregateExprWithOptionalArgs = (
     // Ordering requirements, if any
     Option<Vec<PhysicalSortExpr>>,
 );
-
-/// Create an aggregate expression with a name from a logical expression
-pub fn create_aggregate_expr_with_name_and_maybe_filter(
-    e: &Expr,
-    name: Option<String>,
-    logical_input_schema: &DFSchema,
-    physical_input_schema: &Schema,
-    execution_props: &ExecutionProps,
-) -> Result<AggregateExprWithOptionalArgs> {
-    match e {
-        Expr::AggregateFunction(AggregateFunction {
-            func,
-            distinct,
-            args,
-            filter,
-            order_by,
-            null_treatment,
-        }) => {
-            let name = if let Some(name) = name {
-                name
-            } else {
-                physical_name(e)?
-            };
-
-            let physical_args =
-                create_physical_exprs(args, logical_input_schema, execution_props)?;
-            let filter = match filter {
-                Some(e) => Some(create_physical_expr(
-                    e,
-                    logical_input_schema,
-                    execution_props,
-                )?),
-                None => None,
-            };
-
-            let ignore_nulls = null_treatment.unwrap_or(NullTreatment::RespectNulls)
-                == NullTreatment::IgnoreNulls;
-
-            let (agg_expr, filter, order_by) = {
-                let physical_sort_exprs = match order_by {
-                    Some(exprs) => Some(create_physical_sort_exprs(
-                        exprs,
-                        logical_input_schema,
-                        execution_props,
-                    )?),
-                    None => None,
-                };
-
-                let ordering_reqs: Vec<PhysicalSortExpr> =
-                    physical_sort_exprs.clone().unwrap_or(vec![]);
-
-                let agg_expr =
-                    AggregateExprBuilder::new(func.to_owned(), physical_args.to_vec())
-                        .order_by(ordering_reqs.to_vec())
-                        .schema(Arc::new(physical_input_schema.to_owned()))
-                        .alias(name)
-                        .with_ignore_nulls(ignore_nulls)
-                        .with_distinct(*distinct)
-                        .build()
-                        .map(Arc::new)?;
-
-                (agg_expr, filter, physical_sort_exprs)
-            };
-
-            Ok((agg_expr, filter, order_by))
-        }
-        other => internal_err!("Invalid aggregate expression '{other:?}'"),
-    }
-}
-
-/// Create an aggregate expression from a logical expression or an alias
-pub fn create_aggregate_expr_and_maybe_filter(
-    e: &Expr,
-    logical_input_schema: &DFSchema,
-    physical_input_schema: &Schema,
-    execution_props: &ExecutionProps,
-) -> Result<AggregateExprWithOptionalArgs> {
-    // unpack (nested) aliased logical expressions, e.g. "sum(col) as total"
-    let (name, e) = match e {
-        Expr::Alias(Alias { expr, name, .. }) => (Some(name.clone()), expr.as_ref()),
-        Expr::AggregateFunction(_) => (Some(e.schema_name().to_string()), e),
-        _ => (None, e),
-    };
-
-    create_aggregate_expr_with_name_and_maybe_filter(
-        e,
-        name,
-        logical_input_schema,
-        physical_input_schema,
-        execution_props,
-    )
-}
-
-/// Create a physical sort expression from a logical expression
-pub fn create_physical_sort_expr(
-    e: &SortExpr,
-    input_dfschema: &DFSchema,
-    execution_props: &ExecutionProps,
-) -> Result<PhysicalSortExpr> {
-    let SortExpr {
-        expr,
-        asc,
-        nulls_first,
-    } = e;
-    Ok(PhysicalSortExpr {
-        expr: create_physical_expr(expr, input_dfschema, execution_props)?,
-        options: SortOptions {
-            descending: !asc,
-            nulls_first: *nulls_first,
-        },
-    })
-}
-
-/// Create vector of physical sort expression from a vector of logical expression
-pub fn create_physical_sort_exprs(
-    exprs: &[SortExpr],
-    input_dfschema: &DFSchema,
-    execution_props: &ExecutionProps,
-) -> Result<LexOrdering> {
-    exprs
-        .iter()
-        .map(|expr| create_physical_sort_expr(expr, input_dfschema, execution_props))
-        .collect::<Result<Vec<_>>>()
-}
 
 impl DefaultPhysicalPlanner {
     /// Handles capturing the various plans for EXPLAIN queries
@@ -1996,7 +2075,11 @@ mod tests {
     use datafusion_common::{assert_contains, DFSchemaRef, TableReference};
     use datafusion_execution::runtime_env::RuntimeEnv;
     use datafusion_execution::TaskContext;
-    use datafusion_expr::{col, lit, LogicalPlanBuilder, UserDefinedLogicalNodeCore};
+    use datafusion_expr::expr::Placeholder;
+    use datafusion_expr::{
+        col, lit, BinaryExpr, Extension, LogicalPlanBuilder, Operator,
+        UserDefinedLogicalNodeCore,
+    };
     use datafusion_functions_aggregate::expr_fn::sum;
     use datafusion_physical_expr::EquivalenceProperties;
 
@@ -2056,7 +2139,8 @@ mod tests {
         let logical_input_schema = logical_plan.schema();
         let session_state = make_session_state();
 
-        let cube = create_cube_physical_expr(
+        let planner = DefaultPhysicalPlanner::default();
+        let cube = planner.create_cube_physical_expr(
             &exprs,
             logical_input_schema,
             physical_input_schema,
@@ -2082,8 +2166,9 @@ mod tests {
         let physical_input_schema = physical_input_schema.as_ref();
         let logical_input_schema = logical_plan.schema();
         let session_state = make_session_state();
+        let planner = DefaultPhysicalPlanner::default();
 
-        let rollup = create_rollup_physical_expr(
+        let rollup = planner.create_rollup_physical_expr(
             &exprs,
             logical_input_schema,
             physical_input_schema,
@@ -2735,5 +2820,66 @@ digraph {
         );
 
         assert_contains!(generated_graph, expected_tooltip);
+    }
+
+    #[tokio::test]
+    async fn test_use_custom_expr_planner() {
+        struct PlusForbidder {
+            planner: DefaultPhysicalExpressionPlanner,
+        }
+
+        impl PhysicalExpressionPlanner for PlusForbidder {
+            fn create_physical_expr(
+                &self,
+                expr: &Expr,
+                input_dfschema: &DFSchema,
+                execution_props: &ExecutionProps,
+            ) -> Result<Arc<dyn PhysicalExpr>> {
+                match expr {
+                    Expr::BinaryExpr(BinaryExpr { op, .. }) => match op {
+                        Operator::Plus => {
+                            return Err(DataFusionError::Plan(
+                                "additions are forbidden".into(),
+                            ))
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                };
+                self.planner
+                    .create_physical_expr(expr, input_dfschema, execution_props)
+            }
+        }
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let logical_plan = scan_empty(Some("employee"), &schema, None)
+            .unwrap()
+            .project(vec![
+                col("id")
+                    + Expr::Placeholder(Placeholder {
+                        id: "1".into(),
+                        data_type: Some(DataType::Int32),
+                    }),
+            ])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let planner = DefaultPhysicalPlanner::new(
+            vec![],
+            Arc::new(PlusForbidder {
+                planner: DefaultPhysicalExpressionPlanner,
+            }),
+        );
+
+        let state = make_session_state();
+        let plan = planner.create_physical_plan(&logical_plan, &state).await;
+        assert!(plan.is_err());
+        assert!(plan
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("additions are forbidden"))
     }
 }

@@ -613,7 +613,10 @@ mod tests {
     use arrow_array::Int32Array;
 
     use super::*;
-    use crate::{test::columns, test_util::aggr_test_schema};
+    use crate::{
+        physical_planner::DefaultPhysicalPlanner, test::columns,
+        test_util::aggr_test_schema,
+    };
 
     #[test]
     fn physical_plan_config_no_projection() {
@@ -1091,6 +1094,7 @@ mod tests {
             },
         ];
 
+        let planner = DefaultPhysicalPlanner::default();
         for case in cases {
             let table_schema = Arc::new(Schema::new(
                 case.file_schema
@@ -1109,7 +1113,7 @@ mod tests {
                 .sort
                 .into_iter()
                 .map(|expr| {
-                    crate::physical_planner::create_physical_sort_expr(
+                    planner.create_physical_sort_expr(
                         &expr,
                         &DFSchema::try_from(table_schema.as_ref().clone())?,
                         &ExecutionProps::default(),

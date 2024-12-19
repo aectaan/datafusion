@@ -24,6 +24,7 @@ use crate::{
 };
 
 use arrow::datatypes::Schema;
+use arrow_schema::DataType;
 use datafusion_common::{
     exec_err, not_impl_err, plan_err, DFSchema, Result, ScalarValue, ToDFSchema,
 };
@@ -34,6 +35,413 @@ use datafusion_expr::var_provider::VarType;
 use datafusion_expr::{
     binary_expr, lit, Between, BinaryExpr, Expr, Like, Operator, TryCast,
 };
+
+/// This trait exposes the ability to create physical expressions.
+pub trait PhysicalExpressionPlanner {
+    /// Create a physical expression from a logical expression
+    /// suitable for evaluation
+    ///
+    /// `expr`: the expression to convert
+    ///
+    /// `input_dfschema`: the logical plan schema for evaluating `e`.
+    fn create_physical_expr(
+        &self,
+        expr: &Expr,
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let input_schema: &Schema = &input_dfschema.into();
+        match expr {
+            Expr::Alias(alias) => {
+                self.create_alias_expr(alias, input_dfschema, execution_props)
+            }
+            Expr::Column(c) => {
+                self.create_column_expr(c, input_dfschema, execution_props)
+            }
+            Expr::Literal(value) => {
+                self.create_literal_expr(value, input_dfschema, execution_props)
+            }
+            Expr::ScalarVariable(data_type, variable_names) => self
+                .create_scalar_variable_expr(
+                    data_type,
+                    variable_names,
+                    input_dfschema,
+                    execution_props,
+                ),
+            Expr::IsTrue(expr) => {
+                self.create_is_true_expr(expr, input_dfschema, execution_props)
+            }
+            Expr::IsNotTrue(expr) => {
+                self.create_is_not_true_expr(expr, input_dfschema, execution_props)
+            }
+            Expr::IsFalse(expr) => {
+                self.create_is_false_expr(expr, input_dfschema, execution_props)
+            }
+            Expr::IsNotFalse(expr) => {
+                let binary_op = binary_expr(
+                    expr.as_ref().clone(),
+                    Operator::IsDistinctFrom,
+                    lit(false),
+                );
+                self.create_physical_expr(&binary_op, input_dfschema, execution_props)
+            }
+            Expr::IsUnknown(expr) => {
+                let binary_op = binary_expr(
+                    expr.as_ref().clone(),
+                    Operator::IsNotDistinctFrom,
+                    Expr::Literal(ScalarValue::Boolean(None)),
+                );
+                self.create_physical_expr(&binary_op, input_dfschema, execution_props)
+            }
+            Expr::IsNotUnknown(expr) => {
+                let binary_op = binary_expr(
+                    expr.as_ref().clone(),
+                    Operator::IsDistinctFrom,
+                    Expr::Literal(ScalarValue::Boolean(None)),
+                );
+                self.create_physical_expr(&binary_op, input_dfschema, execution_props)
+            }
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                // Create physical expressions for left and right operands
+                let lhs =
+                    self.create_physical_expr(left, input_dfschema, execution_props)?;
+                let rhs =
+                    self.create_physical_expr(right, input_dfschema, execution_props)?;
+                // Note that the logical planner is responsible
+                // for type coercion on the arguments (e.g. if one
+                // argument was originally Int32 and one was
+                // Int64 they will both be coerced to Int64).
+                //
+                // There should be no coercion during physical
+                // planning.
+                binary(lhs, *op, rhs, input_schema)
+            }
+            Expr::Like(Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                case_insensitive,
+            }) => {
+                if escape_char.is_some() {
+                    return exec_err!("LIKE does not support escape_char");
+                }
+                let physical_expr =
+                    self.create_physical_expr(expr, input_dfschema, execution_props)?;
+                let physical_pattern =
+                    self.create_physical_expr(pattern, input_dfschema, execution_props)?;
+                like(
+                    *negated,
+                    *case_insensitive,
+                    physical_expr,
+                    physical_pattern,
+                    input_schema,
+                )
+            }
+            Expr::SimilarTo(Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                case_insensitive,
+            }) => {
+                if escape_char.is_some() {
+                    return exec_err!("SIMILAR TO does not support escape_char yet");
+                }
+                let physical_expr =
+                    self.create_physical_expr(expr, input_dfschema, execution_props)?;
+                let physical_pattern =
+                    self.create_physical_expr(pattern, input_dfschema, execution_props)?;
+                similar_to(*negated, *case_insensitive, physical_expr, physical_pattern)
+            }
+            Expr::Case(case) => {
+                let expr: Option<Arc<dyn PhysicalExpr>> = if let Some(e) = &case.expr {
+                    Some(self.create_physical_expr(
+                        e.as_ref(),
+                        input_dfschema,
+                        execution_props,
+                    )?)
+                } else {
+                    None
+                };
+                let (when_expr, then_expr): (Vec<&Expr>, Vec<&Expr>) = case
+                    .when_then_expr
+                    .iter()
+                    .map(|(w, t)| (w.as_ref(), t.as_ref()))
+                    .unzip();
+                let when_expr = self.create_physical_exprs_from_ref(
+                    &when_expr,
+                    input_dfschema,
+                    execution_props,
+                )?;
+                let then_expr = self.create_physical_exprs_from_ref(
+                    &then_expr,
+                    input_dfschema,
+                    execution_props,
+                )?;
+                let when_then_expr: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
+                    when_expr
+                        .iter()
+                        .zip(then_expr.iter())
+                        .map(|(w, t)| (Arc::clone(w), Arc::clone(t)))
+                        .collect();
+                let else_expr: Option<Arc<dyn PhysicalExpr>> =
+                    if let Some(e) = &case.else_expr {
+                        Some(self.create_physical_expr(
+                            e.as_ref(),
+                            input_dfschema,
+                            execution_props,
+                        )?)
+                    } else {
+                        None
+                    };
+                Ok(expressions::case(expr, when_then_expr, else_expr)?)
+            }
+            Expr::Cast(Cast { expr, data_type }) => expressions::cast(
+                self.create_physical_expr(expr, input_dfschema, execution_props)?,
+                input_schema,
+                data_type.clone(),
+            ),
+            Expr::TryCast(TryCast { expr, data_type }) => expressions::try_cast(
+                self.create_physical_expr(expr, input_dfschema, execution_props)?,
+                input_schema,
+                data_type.clone(),
+            ),
+            Expr::Not(expr) => expressions::not(self.create_physical_expr(
+                expr,
+                input_dfschema,
+                execution_props,
+            )?),
+            Expr::Negative(expr) => expressions::negative(
+                self.create_physical_expr(expr, input_dfschema, execution_props)?,
+                input_schema,
+            ),
+            Expr::IsNull(expr) => expressions::is_null(self.create_physical_expr(
+                expr,
+                input_dfschema,
+                execution_props,
+            )?),
+            Expr::IsNotNull(expr) => expressions::is_not_null(
+                self.create_physical_expr(expr, input_dfschema, execution_props)?,
+            ),
+            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+                let physical_args =
+                    self.create_physical_exprs(args, input_dfschema, execution_props)?;
+
+                scalar_function::create_physical_expr(
+                    Arc::clone(func).as_ref(),
+                    &physical_args,
+                    input_schema,
+                    args,
+                    input_dfschema,
+                )
+            }
+            Expr::Between(Between {
+                expr,
+                negated,
+                low,
+                high,
+            }) => {
+                let value_expr =
+                    self.create_physical_expr(expr, input_dfschema, execution_props)?;
+                let low_expr =
+                    self.create_physical_expr(low, input_dfschema, execution_props)?;
+                let high_expr =
+                    self.create_physical_expr(high, input_dfschema, execution_props)?;
+
+                // rewrite the between into the two binary operators
+                let binary_expr = binary(
+                    binary(
+                        Arc::clone(&value_expr),
+                        Operator::GtEq,
+                        low_expr,
+                        input_schema,
+                    )?,
+                    Operator::And,
+                    binary(
+                        Arc::clone(&value_expr),
+                        Operator::LtEq,
+                        high_expr,
+                        input_schema,
+                    )?,
+                    input_schema,
+                );
+
+                if *negated {
+                    expressions::not(binary_expr?)
+                } else {
+                    binary_expr
+                }
+            }
+            Expr::InList(InList {
+                expr,
+                list,
+                negated,
+            }) => match expr.as_ref() {
+                Expr::Literal(ScalarValue::Utf8(None)) => {
+                    Ok(expressions::lit(ScalarValue::Boolean(None)))
+                }
+                _ => {
+                    let value_expr =
+                        self.create_physical_expr(expr, input_dfschema, execution_props)?;
+
+                    let list_exprs = self.create_physical_exprs(
+                        list,
+                        input_dfschema,
+                        execution_props,
+                    )?;
+                    expressions::in_list(value_expr, list_exprs, negated, input_schema)
+                }
+            },
+            other => self.create_other_expr(other, input_dfschema, execution_props),
+        }
+    }
+
+    /// Create vector of Physical Expression from a vector of logical expression refs.
+    fn create_physical_exprs_from_ref(
+        &self,
+        exprs: &[&Expr],
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
+        exprs
+            .iter()
+            .map(|expr| self.create_physical_expr(expr, input_dfschema, execution_props))
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Create vector of Physical Expression from a vector of logical expression.
+    fn create_physical_exprs(
+        &self,
+        exprs: &[Expr],
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
+        exprs
+            .iter()
+            .map(|expr| self.create_physical_expr(expr, input_dfschema, execution_props))
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Create physical expression for alias.
+    fn create_alias_expr(
+        &self,
+        &Alias { ref expr, .. }: &Alias,
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        self.create_physical_expr(expr, input_dfschema, execution_props)
+    }
+
+    /// Create physical expression for column.
+    fn create_column_expr(
+        &self,
+        column: &datafusion_common::Column,
+        input_dfschema: &DFSchema,
+        _execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let idx = input_dfschema.index_of_column(column)?;
+        Ok(Arc::new(Column::new(&column.name, idx)))
+    }
+
+    /// Create physical expression for literal.
+    fn create_literal_expr(
+        &self,
+        value: &ScalarValue,
+        _input_dfschema: &DFSchema,
+        _execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(Literal::new(value.clone())))
+    }
+
+    /// Create physical expression for scalar variable.
+    fn create_scalar_variable_expr(
+        &self,
+        _data_type: &DataType,
+        variable_names: &Vec<String>,
+        _input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        if is_system_variables(variable_names) {
+            match execution_props.get_var_provider(VarType::System) {
+                Some(provider) => {
+                    let scalar_value = provider.get_value(variable_names.clone())?;
+                    Ok(Arc::new(Literal::new(scalar_value)))
+                }
+                _ => plan_err!("No system variable provider found"),
+            }
+        } else {
+            match execution_props.get_var_provider(VarType::UserDefined) {
+                Some(provider) => {
+                    let scalar_value = provider.get_value(variable_names.clone())?;
+                    Ok(Arc::new(Literal::new(scalar_value)))
+                }
+                _ => plan_err!("No user defined variable provider found"),
+            }
+        }
+    }
+
+    /// Create physical expression for [`Expr::IsTrue`].
+    fn create_is_true_expr(
+        &self,
+        expr: &Box<Expr>,
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let binary_op = binary_expr(
+            expr.as_ref().clone(),
+            Operator::IsNotDistinctFrom,
+            lit(true),
+        );
+        self.create_physical_expr(&binary_op, input_dfschema, execution_props)
+    }
+
+    /// Create physical expression for [`Expr::IsNotTrue`].
+    fn create_is_not_true_expr(
+        &self,
+        expr: &Box<Expr>,
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let binary_op =
+            binary_expr(expr.as_ref().clone(), Operator::IsDistinctFrom, lit(true));
+        self.create_physical_expr(&binary_op, input_dfschema, execution_props)
+    }
+
+    // TODO:
+    // - proper comments.
+    // - function for other expressions.
+    fn create_is_false_expr(
+        &self,
+        expr: &Box<Expr>,
+        input_dfschema: &DFSchema,
+        execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let binary_op = binary_expr(
+            expr.as_ref().clone(),
+            Operator::IsNotDistinctFrom,
+            lit(false),
+        );
+        self.create_physical_expr(&binary_op, input_dfschema, execution_props)
+    }
+
+    // Create physical expression for expressions that not supported
+    // in default planner.
+    fn create_other_expr(
+        &self,
+        expr: &Expr,
+        _input_dfschema: &DFSchema,
+        _execution_props: &ExecutionProps,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        not_impl_err!("Physical plan does not support logical expression {expr:?}")
+    }
+}
+
+/// Default physical expression planner.
+#[derive(Default)]
+pub struct DefaultPhysicalExpressionPlanner;
+
+impl PhysicalExpressionPlanner for DefaultPhysicalExpressionPlanner {}
 
 /// [PhysicalExpr] evaluate DataFusion expressions such as `A + 1`, or `CAST(c1
 /// AS int)`.
@@ -108,275 +516,11 @@ pub fn create_physical_expr(
     input_dfschema: &DFSchema,
     execution_props: &ExecutionProps,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    let input_schema: &Schema = &input_dfschema.into();
-
-    match e {
-        Expr::Alias(Alias { expr, .. }) => {
-            Ok(create_physical_expr(expr, input_dfschema, execution_props)?)
-        }
-        Expr::Column(c) => {
-            let idx = input_dfschema.index_of_column(c)?;
-            Ok(Arc::new(Column::new(&c.name, idx)))
-        }
-        Expr::Literal(value) => Ok(Arc::new(Literal::new(value.clone()))),
-        Expr::ScalarVariable(_, variable_names) => {
-            if is_system_variables(variable_names) {
-                match execution_props.get_var_provider(VarType::System) {
-                    Some(provider) => {
-                        let scalar_value = provider.get_value(variable_names.clone())?;
-                        Ok(Arc::new(Literal::new(scalar_value)))
-                    }
-                    _ => plan_err!("No system variable provider found"),
-                }
-            } else {
-                match execution_props.get_var_provider(VarType::UserDefined) {
-                    Some(provider) => {
-                        let scalar_value = provider.get_value(variable_names.clone())?;
-                        Ok(Arc::new(Literal::new(scalar_value)))
-                    }
-                    _ => plan_err!("No user defined variable provider found"),
-                }
-            }
-        }
-        Expr::IsTrue(expr) => {
-            let binary_op = binary_expr(
-                expr.as_ref().clone(),
-                Operator::IsNotDistinctFrom,
-                lit(true),
-            );
-            create_physical_expr(&binary_op, input_dfschema, execution_props)
-        }
-        Expr::IsNotTrue(expr) => {
-            let binary_op =
-                binary_expr(expr.as_ref().clone(), Operator::IsDistinctFrom, lit(true));
-            create_physical_expr(&binary_op, input_dfschema, execution_props)
-        }
-        Expr::IsFalse(expr) => {
-            let binary_op = binary_expr(
-                expr.as_ref().clone(),
-                Operator::IsNotDistinctFrom,
-                lit(false),
-            );
-            create_physical_expr(&binary_op, input_dfschema, execution_props)
-        }
-        Expr::IsNotFalse(expr) => {
-            let binary_op =
-                binary_expr(expr.as_ref().clone(), Operator::IsDistinctFrom, lit(false));
-            create_physical_expr(&binary_op, input_dfschema, execution_props)
-        }
-        Expr::IsUnknown(expr) => {
-            let binary_op = binary_expr(
-                expr.as_ref().clone(),
-                Operator::IsNotDistinctFrom,
-                Expr::Literal(ScalarValue::Boolean(None)),
-            );
-            create_physical_expr(&binary_op, input_dfschema, execution_props)
-        }
-        Expr::IsNotUnknown(expr) => {
-            let binary_op = binary_expr(
-                expr.as_ref().clone(),
-                Operator::IsDistinctFrom,
-                Expr::Literal(ScalarValue::Boolean(None)),
-            );
-            create_physical_expr(&binary_op, input_dfschema, execution_props)
-        }
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            // Create physical expressions for left and right operands
-            let lhs = create_physical_expr(left, input_dfschema, execution_props)?;
-            let rhs = create_physical_expr(right, input_dfschema, execution_props)?;
-            // Note that the logical planner is responsible
-            // for type coercion on the arguments (e.g. if one
-            // argument was originally Int32 and one was
-            // Int64 they will both be coerced to Int64).
-            //
-            // There should be no coercion during physical
-            // planning.
-            binary(lhs, *op, rhs, input_schema)
-        }
-        Expr::Like(Like {
-            negated,
-            expr,
-            pattern,
-            escape_char,
-            case_insensitive,
-        }) => {
-            if escape_char.is_some() {
-                return exec_err!("LIKE does not support escape_char");
-            }
-            let physical_expr =
-                create_physical_expr(expr, input_dfschema, execution_props)?;
-            let physical_pattern =
-                create_physical_expr(pattern, input_dfschema, execution_props)?;
-            like(
-                *negated,
-                *case_insensitive,
-                physical_expr,
-                physical_pattern,
-                input_schema,
-            )
-        }
-        Expr::SimilarTo(Like {
-            negated,
-            expr,
-            pattern,
-            escape_char,
-            case_insensitive,
-        }) => {
-            if escape_char.is_some() {
-                return exec_err!("SIMILAR TO does not support escape_char yet");
-            }
-            let physical_expr =
-                create_physical_expr(expr, input_dfschema, execution_props)?;
-            let physical_pattern =
-                create_physical_expr(pattern, input_dfschema, execution_props)?;
-            similar_to(*negated, *case_insensitive, physical_expr, physical_pattern)
-        }
-        Expr::Case(case) => {
-            let expr: Option<Arc<dyn PhysicalExpr>> = if let Some(e) = &case.expr {
-                Some(create_physical_expr(
-                    e.as_ref(),
-                    input_dfschema,
-                    execution_props,
-                )?)
-            } else {
-                None
-            };
-            let (when_expr, then_expr): (Vec<&Expr>, Vec<&Expr>) = case
-                .when_then_expr
-                .iter()
-                .map(|(w, t)| (w.as_ref(), t.as_ref()))
-                .unzip();
-            let when_expr =
-                create_physical_exprs(when_expr, input_dfschema, execution_props)?;
-            let then_expr =
-                create_physical_exprs(then_expr, input_dfschema, execution_props)?;
-            let when_then_expr: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
-                when_expr
-                    .iter()
-                    .zip(then_expr.iter())
-                    .map(|(w, t)| (Arc::clone(w), Arc::clone(t)))
-                    .collect();
-            let else_expr: Option<Arc<dyn PhysicalExpr>> =
-                if let Some(e) = &case.else_expr {
-                    Some(create_physical_expr(
-                        e.as_ref(),
-                        input_dfschema,
-                        execution_props,
-                    )?)
-                } else {
-                    None
-                };
-            Ok(expressions::case(expr, when_then_expr, else_expr)?)
-        }
-        Expr::Cast(Cast { expr, data_type }) => expressions::cast(
-            create_physical_expr(expr, input_dfschema, execution_props)?,
-            input_schema,
-            data_type.clone(),
-        ),
-        Expr::TryCast(TryCast { expr, data_type }) => expressions::try_cast(
-            create_physical_expr(expr, input_dfschema, execution_props)?,
-            input_schema,
-            data_type.clone(),
-        ),
-        Expr::Not(expr) => {
-            expressions::not(create_physical_expr(expr, input_dfschema, execution_props)?)
-        }
-        Expr::Negative(expr) => expressions::negative(
-            create_physical_expr(expr, input_dfschema, execution_props)?,
-            input_schema,
-        ),
-        Expr::IsNull(expr) => expressions::is_null(create_physical_expr(
-            expr,
-            input_dfschema,
-            execution_props,
-        )?),
-        Expr::IsNotNull(expr) => expressions::is_not_null(create_physical_expr(
-            expr,
-            input_dfschema,
-            execution_props,
-        )?),
-        Expr::ScalarFunction(ScalarFunction { func, args }) => {
-            let physical_args =
-                create_physical_exprs(args, input_dfschema, execution_props)?;
-
-            scalar_function::create_physical_expr(
-                Arc::clone(func).as_ref(),
-                &physical_args,
-                input_schema,
-                args,
-                input_dfschema,
-            )
-        }
-        Expr::Between(Between {
-            expr,
-            negated,
-            low,
-            high,
-        }) => {
-            let value_expr = create_physical_expr(expr, input_dfschema, execution_props)?;
-            let low_expr = create_physical_expr(low, input_dfschema, execution_props)?;
-            let high_expr = create_physical_expr(high, input_dfschema, execution_props)?;
-
-            // rewrite the between into the two binary operators
-            let binary_expr = binary(
-                binary(
-                    Arc::clone(&value_expr),
-                    Operator::GtEq,
-                    low_expr,
-                    input_schema,
-                )?,
-                Operator::And,
-                binary(
-                    Arc::clone(&value_expr),
-                    Operator::LtEq,
-                    high_expr,
-                    input_schema,
-                )?,
-                input_schema,
-            );
-
-            if *negated {
-                expressions::not(binary_expr?)
-            } else {
-                binary_expr
-            }
-        }
-        Expr::InList(InList {
-            expr,
-            list,
-            negated,
-        }) => match expr.as_ref() {
-            Expr::Literal(ScalarValue::Utf8(None)) => {
-                Ok(expressions::lit(ScalarValue::Boolean(None)))
-            }
-            _ => {
-                let value_expr =
-                    create_physical_expr(expr, input_dfschema, execution_props)?;
-
-                let list_exprs =
-                    create_physical_exprs(list, input_dfschema, execution_props)?;
-                expressions::in_list(value_expr, list_exprs, negated, input_schema)
-            }
-        },
-        other => {
-            not_impl_err!("Physical plan does not support logical expression {other:?}")
-        }
-    }
-}
-
-/// Create vector of Physical Expression from a vector of logical expression
-pub fn create_physical_exprs<'a, I>(
-    exprs: I,
-    input_dfschema: &DFSchema,
-    execution_props: &ExecutionProps,
-) -> Result<Vec<Arc<dyn PhysicalExpr>>>
-where
-    I: IntoIterator<Item = &'a Expr>,
-{
-    exprs
-        .into_iter()
-        .map(|expr| create_physical_expr(expr, input_dfschema, execution_props))
-        .collect::<Result<Vec<_>>>()
+    DefaultPhysicalExpressionPlanner.create_physical_expr(
+        e,
+        input_dfschema,
+        execution_props,
+    )
 }
 
 /// Convert a logical expression to a physical expression (without any simplification, etc)

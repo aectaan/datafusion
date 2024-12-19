@@ -33,7 +33,7 @@ use crate::physical_plan::{
     common, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
     Partitioning, SendableRecordBatchStream,
 };
-use crate::physical_planner::create_physical_sort_exprs;
+use crate::physical_planner::DefaultPhysicalPlanner;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -224,6 +224,7 @@ impl TableProvider for MemTable {
 
         let show_sizes = state.config_options().explain.show_sizes;
         exec = exec.with_show_sizes(show_sizes);
+        let phys_planner = DefaultPhysicalPlanner::default();
 
         // add sort information if present
         let sort_order = self.sort_order.lock();
@@ -233,7 +234,7 @@ impl TableProvider for MemTable {
             let file_sort_order = sort_order
                 .iter()
                 .map(|sort_exprs| {
-                    create_physical_sort_exprs(
+                    phys_planner.create_physical_sort_exprs(
                         sort_exprs,
                         &df_schema,
                         state.execution_props(),
