@@ -1939,6 +1939,7 @@ mod tests {
                     .build()?,
             ];
 
+
         let blocking_exec = Arc::new(BlockingExec::new(Arc::clone(&schema), 1));
         let refs = blocking_exec.refs();
         let aggregate_exec = Arc::new(AggregateExec::try_new(
