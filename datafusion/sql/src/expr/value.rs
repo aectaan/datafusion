@@ -69,16 +69,29 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Cow::Borrowed(unsigned_number)
         };
 
-        // Try to parse as i64 first, then u64 if negative is false, then decimal or f64
-
-        if let Ok(n) = signed_number.parse::<i64>() {
-            return Ok(lit(n));
+        macro_rules! try_parse_num {
+            ($num:expr, $ty:ident) => {{
+                if let Ok(n) = $num.parse::<$ty>() {
+                    return Ok(lit(n));
+                }
+            }};
         }
 
+        try_parse_num!(signed_number, i8);
         if !negative {
-            if let Ok(n) = unsigned_number.parse::<u64>() {
-                return Ok(lit(n));
-            }
+            try_parse_num!(unsigned_number, u8);
+        }
+        try_parse_num!(signed_number, i16);
+        if !negative {
+            try_parse_num!(unsigned_number, u16);
+        }
+        try_parse_num!(signed_number, i32);
+        if !negative {
+            try_parse_num!(unsigned_number, u32);
+        }
+        try_parse_num!(signed_number, i64);
+        if !negative {
+            try_parse_num!(unsigned_number, u64);
         }
 
         if self.options.parse_float_as_decimal {
