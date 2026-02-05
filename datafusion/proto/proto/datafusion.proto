@@ -775,6 +775,8 @@ message PhysicalPlanNode {
     AsyncFuncExecNode async_func = 36;
     BufferExecNode buffer = 37;
     ArrowScanExecNode arrow_scan = 38;
+
+    ValuesExecNode values_scan = 50;
   }
 }
 
@@ -1149,6 +1151,11 @@ message MemoryScanExecNode {
   repeated PhysicalSortExprNodeCollection sort_information = 4;
   bool show_sizes = 5;
   optional uint32 fetch = 6;
+}
+
+message ValuesExecNode {
+  datafusion_common.Schema schema = 1;
+  repeated PhysicalExprNode exprs = 2;
 }
 
 message CooperativeExecNode {
