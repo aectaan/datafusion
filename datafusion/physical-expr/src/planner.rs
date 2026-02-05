@@ -20,10 +20,10 @@ use std::sync::Arc;
 use crate::ScalarFunctionExpr;
 use crate::{
     PhysicalExpr,
-    expressions::{self, Column, Literal, binary, like, similar_to},
+    expressions::{self, Column, Literal, PlaceholderExpr, binary, like, similar_to},
 };
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::metadata::{FieldMetadata, format_type_and_metadata};
 use datafusion_common::{
@@ -301,11 +301,15 @@ pub fn create_physical_expr(
                 );
             }
 
-            expressions::cast(
-                create_physical_expr(expr, input_dfschema, execution_props)?,
-                input_schema,
-                field.data_type().clone(),
-            )
+            let data_type = field.data_type().clone();
+            let mut expr = create_physical_expr(expr, input_dfschema, execution_props)?;
+            if let Some(placeholder) = expr.as_any().downcast_ref::<PlaceholderExpr>()
+                && placeholder.field.is_none()
+            {
+                expr = expressions::placeholder(&placeholder.id, data_type.clone());
+            }
+
+            expressions::cast(expr, input_schema, data_type)
         }
         Expr::TryCast(TryCast { expr, field }) => {
             if !field.metadata().is_empty() {
@@ -320,11 +324,16 @@ pub fn create_physical_expr(
                 );
             }
 
-            expressions::try_cast(
-                create_physical_expr(expr, input_dfschema, execution_props)?,
-                input_schema,
-                field.data_type().clone(),
-            )
+            let mut expr = create_physical_expr(expr, input_dfschema, execution_props)?;
+            if let Some(placeholder) = expr.as_any().downcast_ref::<PlaceholderExpr>()
+                && placeholder.field.is_none()
+            {
+                // To maintain try_cast behavior, we initially resolve the placeholder with the
+                // Utf8 data type.
+                expr = expressions::placeholder(&placeholder.id, DataType::Utf8);
+            }
+
+            expressions::try_cast(expr, input_schema, field.data_type().clone())
         }
         Expr::Not(expr) => {
             expressions::not(create_physical_expr(expr, input_dfschema, execution_props)?)
@@ -409,9 +418,13 @@ pub fn create_physical_expr(
                 expressions::in_list(value_expr, list_exprs, negated, input_schema)
             }
         },
-        Expr::Placeholder(Placeholder { id, .. }) => {
-            exec_err!("Placeholder '{id}' was not provided a value for execution.")
-        }
+        Expr::Placeholder(Placeholder { id, field }) => match field {
+            Some(field) => Ok(Arc::new(PlaceholderExpr::new_with_field(
+                id.clone(),
+                Arc::clone(field),
+            ))),
+            None => Ok(Arc::new(PlaceholderExpr::new_without_data_type(id.clone()))),
+        },
         other => {
             not_impl_err!("Physical plan does not support logical expression {other:?}")
         }
