@@ -37,10 +37,9 @@ logical_plan
 02)--Projection: column1 AS id, column2 AS name
 03)----Values: ($1, Utf8View("Samanta") AS Utf8("Samanta")), (Int32(5) AS Int64(5), $2)
 physical_plan
-01)TransformPlanExec: rules=[ResolvePlaceholders: plans_to_modify=1]
-02)--DataSinkExec: sink=MemoryTable (partitions=1)
-03)----ProjectionExec: expr=[column1@0 as id, column2@1 as name]
-04)------DataSourceExec: placeholders=2
+01)DataSinkExec: sink=MemoryTable (partitions=1)
+02)--ProjectionExec: expr=[column1@0 as id, column2@1 as name]
+03)----DataSourceExec: placeholders=2
 
 # Filter with multiple placeholders
 query TT

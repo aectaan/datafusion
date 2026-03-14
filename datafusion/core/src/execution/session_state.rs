@@ -1844,14 +1844,17 @@ impl ContextProvider for SessionContextProvider<'_> {
             );
         let simplifier = ExprSimplifier::new(simplify_context);
         let schema = DFSchema::empty();
-        let args = args
-            .into_iter()
-            .map(|arg| {
-                simplifier
-                    .coerce(arg, &schema)
-                    .and_then(|e| simplifier.simplify(e))
-            })
-            .collect::<datafusion_common::Result<Vec<_>>>()?;
+        let args = if !self.state.config.options().catalog.simplify_udtf_args {
+            args
+        } else {
+            args.into_iter()
+                .map(|arg| {
+                    simplifier
+                        .coerce(arg, &schema)
+                        .and_then(|e| simplifier.simplify(e))
+                })
+                .collect::<datafusion_common::Result<Vec<_>>>()?
+        };
         let provider = tbl_func.create_table_provider_with_args(TableFunctionArgs {
             args: &args,
             session: self.state,

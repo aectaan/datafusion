@@ -257,6 +257,9 @@ config_namespace! {
         /// parallel file scanning. Setting this to `true` ensures that newlines in values are
         /// parsed successfully, which may reduce performance.
         pub newlines_in_values: bool, default = false
+
+        /// Specifies whether UDTF arguments expressions must be simplified.
+        pub simplify_udtf_args: bool, default = true
     }
 }
 
