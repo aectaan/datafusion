@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use super::ExecutionPlan;
 
 /// Visit all children of this plan, according to the order defined on `ExecutionPlanVisitor`.
@@ -26,7 +28,7 @@ pub fn accept<V: ExecutionPlanVisitor>(
     visitor: &mut V,
 ) -> Result<(), V::Error> {
     visitor.pre_visit(plan)?;
-    for child in plan.children() {
+    for child in visitor.f_children(plan) {
         visit_execution_plan(child.as_ref(), visitor)?;
     }
     visitor.post_visit(plan)?;
@@ -63,6 +65,14 @@ pub trait ExecutionPlanVisitor {
     /// The type of error returned by this visitor
     type Error;
 
+    /// Invoked on an `ExecutionPlan` to acquire children list to visit.
+    fn f_children<'p>(
+        &mut self,
+        plan: &'p dyn ExecutionPlan,
+    ) -> Vec<&'p Arc<dyn ExecutionPlan>> {
+        plan.children()
+    }
+
     /// Invoked on an `ExecutionPlan` plan before any of its child
     /// inputs have been visited. If Ok(true) is returned, the
     /// recursion continues. If Err(..) or Ok(false) are returned, the
@@ -86,7 +96,7 @@ pub fn visit_execution_plan<V: ExecutionPlanVisitor>(
     visitor: &mut V,
 ) -> Result<(), V::Error> {
     visitor.pre_visit(plan)?;
-    for child in plan.children() {
+    for child in visitor.f_children(plan) {
         visit_execution_plan(child.as_ref(), visitor)?;
     }
     visitor.post_visit(plan)?;

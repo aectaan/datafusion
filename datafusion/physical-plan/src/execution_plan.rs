@@ -207,6 +207,14 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// joins).
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>>;
 
+    /// Get a list of children that must be displayed on the explanation stage.
+    /// Note, that this list can be different from [`Self::children`] if, e.g.,
+    /// some child is executed remotely and it is not required to apply plan
+    /// transformation for it, but it still should be displayed in explain.
+    fn children_to_explain(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.children()
+    }
+
     /// Apply a closure `f` to each expression (non-recursively) in the current
     /// physical plan node. This does not include expressions in any children.
     ///

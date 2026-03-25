@@ -413,6 +413,14 @@ struct IndentVisitor<'a, 'b> {
 
 impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
     type Error = fmt::Error;
+
+    fn f_children<'p>(
+        &mut self,
+        plan: &'p dyn ExecutionPlan,
+    ) -> Vec<&'p std::sync::Arc<dyn ExecutionPlan>> {
+        plan.children_to_explain()
+    }
+
     fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
         write!(self.f, "{:indent$}", "", indent = self.indent * 2)?;
         plan.fmt_as(self.t, self.f)?;
@@ -490,6 +498,13 @@ impl GraphvizVisitor<'_, '_> {
 
 impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
     type Error = fmt::Error;
+
+    fn f_children<'p>(
+        &mut self,
+        plan: &'p dyn ExecutionPlan,
+    ) -> Vec<&'p std::sync::Arc<dyn ExecutionPlan>> {
+        plan.children_to_explain()
+    }
 
     fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
         let id = self.graphviz_builder.next_id();

@@ -141,7 +141,7 @@ impl RenderTree {
 /// # Returns
 /// * A tuple of (width, height) representing the dimensions needed for the tree
 fn get_tree_width_height(plan: &dyn ExecutionPlan) -> (usize, usize) {
-    let children = plan.children();
+    let children = plan.children_to_explain();
 
     // Leaf nodes take up 1x1 space
     if children.is_empty() {
@@ -210,7 +210,7 @@ fn create_tree_recursive(
 
     let mut node = RenderTreeNode::new(plan.name().to_string(), extra_info);
 
-    let children = plan.children();
+    let children = plan.children_to_explain();
 
     if children.is_empty() {
         result.set_node(x, y, Arc::new(node));
